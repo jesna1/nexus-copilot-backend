@@ -15,11 +15,17 @@ async def websocket_chat_endpoint(websocket: WebSocket):
         while True:
             raw_data = await websocket.receive_text()
             
-            # Safe JSON decoding for string or structured payload
+            # Safe JSON parsing
             try:
                 payload = json.loads(raw_data)
             except Exception:
                 payload = {"prompt": raw_data}
+
+            # 1. HANDLE PING / CONTROL FRAMES
+            msg_type = payload.get("type")
+            if msg_type == "ping":
+                await websocket.send_json({"type": "pong"})
+                continue
 
             prompt = payload.get("prompt", "").strip()
             doc_context = payload.get("document_context")
@@ -29,55 +35,66 @@ async def websocket_chat_endpoint(websocket: WebSocket):
                 await websocket.send_json({"type": "error", "message": "Empty prompt"})
                 continue
 
-            # 1. Compute embedding ONLY on the user query for accurate Cache Matching
-            query_embedding = await gemini_service.get_embedding(prompt)
-
-            # 2. Check Redis Semantic Cache when no active document context is forced
+            # 2. EMBEDDING & CACHE MATCHING
+            # Only hit cache if NO active document context is forced
             if not doc_context:
-                cached_response, similarity = await semantic_cache.search(query_embedding, threshold=0.92)
-                if cached_response:
-                    await websocket.send_json({
-                        "type": "start",
-                        "engine": f"Redis Semantic Cache (Similarity: {similarity:.2%})"
-                    })
-                    await websocket.send_json({"type": "chunk", "content": cached_response})
-                    await websocket.send_json({"type": "end"})
-                    continue
+                try:
+                    query_embedding = await gemini_service.get_embedding(prompt)
+                    cached_response, similarity = await semantic_cache.search(query_embedding, threshold=0.92)
+                    if cached_response:
+                        await websocket.send_json({
+                            "type": "start",
+                            "engine": f"Redis Semantic Cache (Similarity: {similarity:.2%})"
+                        })
+                        await websocket.send_json({"type": "chunk", "content": cached_response})
+                        await websocket.send_json({"type": "end"})
+                        continue
+                except Exception as cache_err:
+                    print(f"Cache/Embedding error: {cache_err}")
+                    query_embedding = None
+            else:
+                query_embedding = None
 
-            # 3. Build LLM System Prompt + User Query + Document Context
+            # 3. PROMPT CONSTRUCTION
             if doc_context:
-                full_prompt = f"""You are Nexus Copilot, an AI assistant. Analyze the provided document context and directly answer the user's question.
+                full_prompt = f"""You are Nexus Copilot, an AI assistant. Analyze the provided document context and answer the user's question.
 
-### DOCUMENT CONTEXT ({doc_name or 'Attached File'}):
+DOCUMENT NAME: {doc_name or 'Attached File'}
+
+DOCUMENT CONTEXT:
 {doc_context}
 
-### USER QUESTION:
+USER QUESTION:
 {prompt}
 
-### INSTRUCTIONS:
-1. Do NOT dump or repeat the raw document.
-2. Answer the user question directly using facts from the document context.
-3. If the context does not contain the answer, explicitly state that."""
+INSTRUCTIONS:
+- Directly answer the question using the facts provided in the DOCUMENT CONTEXT above.
+- Do NOT repeat or dump the full document.
+- Provide clear, synthesis-driven answers.
+- If the context does not contain the information required to answer, clearly state that."""
             else:
                 full_prompt = prompt
 
-            # 4. Stream response via Gemini API
+            # 4. STREAM GEMINI RESPONSE
             await websocket.send_json({"type": "start", "engine": "Cloud Gemini Gateway"})
             full_response = ""
 
-            async for chunk in gemini_service.stream_response(full_prompt):
-                full_response += chunk
-                await websocket.send_json({"type": "chunk", "content": chunk})
+            try:
+                async for chunk in gemini_service.stream_response(full_prompt):
+                    full_response += chunk
+                    await websocket.send_json({"type": "chunk", "content": chunk})
 
-            # 5. Store Cache Entry (only for non-document context standard queries)
-            if not doc_context:
-                cache_id = str(uuid.uuid4())
-                await semantic_cache.store(cache_id, prompt, full_response, query_embedding)
+                # 5. STORE CACHE
+                if not doc_context and query_embedding:
+                    cache_id = str(uuid.uuid4())
+                    await semantic_cache.store(cache_id, prompt, full_response, query_embedding)
+
+            except Exception as stream_err:
+                await websocket.send_json({"type": "error", "message": f"Gemini Stream Error: {str(stream_err)}"})
 
             await websocket.send_json({"type": "end"})
 
     except WebSocketDisconnect:
         print("Client disconnected from WebSocket connection")
     except Exception as e:
-        await websocket.send_json({"type": "error", "message": str(e)})
-        await websocket.close()
+        print(f"Unhandled WebSocket Exception: {e}")
