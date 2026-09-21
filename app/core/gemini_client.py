@@ -1,74 +1,42 @@
 import os
 import itertools
+import asyncio
 from typing import AsyncGenerator
 from google import genai
 from google.genai import errors
 from app.core.config import settings
 
-# Active standard flash model
-MODEL_NAME = "gemini-2.5-flash"
+# Primary and Fallback Models
+PRIMARY_MODEL = "gemini-2.5-flash"
+FALLBACK_MODEL = "gemini-1.5-flash"
 
 class GeminiClientPool:
     def __init__(self):
-        # Load keys from settings or environment
         raw_keys = getattr(settings, "GEMINI_API_KEYS", "") or os.getenv("GEMINI_API_KEYS", "")
-        
-        # Fallback to single GEMINI_API_KEY if key pool isn't configured
         if not raw_keys and hasattr(settings, "GEMINI_API_KEY"):
             raw_keys = settings.GEMINI_API_KEY
 
         self.api_keys = [k.strip() for k in raw_keys.split(",") if k.strip()]
-        
         if not self.api_keys:
             raise ValueError("No Gemini API keys configured in environment.")
 
-        # Infinite round-robin iterator across provided keys
         self._key_cycle = itertools.cycle(self.api_keys)
 
     def _get_next_client(self) -> genai.Client:
-        """Fetch a genai.Client initialized with the next key in rotation."""
         key = next(self._key_cycle)
         return genai.Client(api_key=key)
 
-    async def get_embedding(self, text: str) -> list[float]:
-        """Generate text embedding with automatic 429 key failover."""
-        attempts = len(self.api_keys)
-        
-        for attempt in range(attempts):
-            client = self._get_next_client()
-            try:
-                response = await client.aio.models.embed_content(
-                    model="text-embedding-004",
-                    contents=text,
-                )
-                if hasattr(response, "embedding") and response.embedding:
-                    return response.embedding.values
-                elif hasattr(response, "embeddings") and response.embeddings:
-                    return response.embeddings[0].values
-                raise ValueError("No embedding vector returned in response.")
-                
-            except errors.APIError as e:
-                if e.code in (429, 404) or "RESOURCE_EXHAUSTED" in str(e):
-                    print(f"[Gemini Key Failover] Error on embedding (Attempt {attempt+1}/{attempts}). Rotating key...")
-                    continue
-                raise e
-            except Exception as e:
-                if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
-                    continue
-                raise e
-
-        raise Exception("All configured Gemini API keys failed or exceeded quota.")
-
     async def stream_response(self, prompt: str) -> AsyncGenerator[str, None]:
-        """Stream response chunks using modern client stream model."""
-        attempts = len(self.api_keys)
+        attempts = len(self.api_keys) * 2  # Try each key with primary, then fallback model
 
         for attempt in range(attempts):
             client = self._get_next_client()
+            # Try primary model first, switch to fallback model on second round
+            model_to_use = PRIMARY_MODEL if attempt < len(self.api_keys) else FALLBACK_MODEL
+
             try:
-                # Primary streaming method via client.aio.models
                 response = await client.aio.models.generate_content_stream(
-                    model=MODEL_NAME,
+                    model=model_to_use,
                     contents=prompt,
                 )
 
@@ -78,17 +46,14 @@ class GeminiClientPool:
                 return
 
             except errors.APIError as e:
-                # Handle 404 Model Not Found / 429 Quota Exceeded by falling back / rotating
-                if e.code in (429, 404) or "RESOURCE_EXHAUSTED" in str(e) or "NOT_FOUND" in str(e):
-                    print(f"[Gemini Key Failover] Code {e.code} on stream (Attempt {attempt+1}/{attempts}). Switching key/model...")
-                    continue
-                raise e
+                print(f"[Gemini Error] Code {e.code} using {model_to_use}. Rotating key...")
+                await asyncio.sleep(0.5)  # Backoff to avoid instantly burning TPM/RPM
+                continue
             except Exception as e:
-                if "429" in str(e) or "404" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
-                    print(f"[Gemini Key Failover] Exception encountered ({e}). Rotating key...")
-                    continue
-                raise e
+                print(f"[Gemini Exception] {e}. Rotating key...")
+                await asyncio.sleep(0.5)
+                continue
 
-        raise Exception("All Gemini API keys hit quota limits or returned non-responsive model endpoints.")
+        raise Exception("All API keys hit quota limits or models were unresponsive. Please retry in 60 seconds.")
 
 gemini_service = GeminiClientPool()
