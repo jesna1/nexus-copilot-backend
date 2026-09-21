@@ -69,7 +69,7 @@ class GeminiClientPool:
             try:
                 # Async streaming via client.aio
                 response = await client.aio.models.generate_content_stream(
-                    model="gemini-2.0-flash",
+                    model="gemini-2.5-flash",
                     contents=prompt,
                 )
 
