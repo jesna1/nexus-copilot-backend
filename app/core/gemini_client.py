@@ -1,13 +1,13 @@
 import os
 import itertools
 import asyncio
-from typing import AsyncGenerator
+from typing import AsyncGenerator, List
 from google import genai
 from google.genai import errors
 from app.core.config import settings
 
 # Primary and Fallback Models
-PRIMARY_MODEL = "gemini-2.5-flash"
+PRIMARY_MODEL = "gemini-2.0-flash"  # Ensure this matches valid current model names
 FALLBACK_MODEL = "gemini-1.5-flash"
 
 class GeminiClientPool:
@@ -26,12 +26,27 @@ class GeminiClientPool:
         key = next(self._key_cycle)
         return genai.Client(api_key=key)
 
+    async def get_embedding(self, text: str) -> List[float]:
+        """Generates text embeddings for Redis Semantic Caching."""
+        attempts = len(self.api_keys)
+        for _ in range(attempts):
+            client = self._get_next_client()
+            try:
+                response = await client.aio.models.embed_content(
+                    model="text-embedding-004",
+                    contents=text,
+                )
+                return response.embedding.values
+            except Exception as e:
+                print(f"[Embedding Error] Rotating key... Details: {e}")
+                await asyncio.sleep(0.2)
+        raise Exception("All API keys failed for embedding generation.")
+
     async def stream_response(self, prompt: str) -> AsyncGenerator[str, None]:
         attempts = len(self.api_keys) * 2  # Try each key with primary, then fallback model
 
         for attempt in range(attempts):
             client = self._get_next_client()
-            # Try primary model first, switch to fallback model on second round
             model_to_use = PRIMARY_MODEL if attempt < len(self.api_keys) else FALLBACK_MODEL
 
             try:
